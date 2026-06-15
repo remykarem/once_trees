@@ -288,6 +288,40 @@ class ReadOnceDecisionTreeClassifier(ClassifierMixin, BaseEstimator):
         return {"allow_nan": True}
 
     # -- introspection -------------------------------------------------------
+    @property
+    def feature_importances_(self) -> np.ndarray:
+        """Mean decrease in impurity per feature, normalized to sum to 1.
+
+        Computed sklearn-style: each internal node contributes
+        ``(n_node / n_total) * (impurity - weighted child impurity)`` to its
+        split feature; the per-feature totals are normalized to sum to 1
+        (an all-zero vector is returned unchanged).
+        """
+        check_is_fitted(self)
+        importances = np.zeros(self.n_features_in_, dtype=float)
+        n_total = self.tree_.n_samples
+
+        def _counts(node):
+            if node.is_leaf:
+                return node.proba * node.n_samples
+            cl = _counts(node.left)
+            cr = _counts(node.right)
+            c = cl + cr
+            imp = _impurity_from_counts(c, self.criterion)
+            imp_l = _impurity_from_counts(cl, self.criterion)
+            imp_r = _impurity_from_counts(cr, self.criterion)
+            weighted = (node.left.n_samples * imp_l
+                        + node.right.n_samples * imp_r) / node.n_samples
+            importances[node.feature] += (
+                node.n_samples / n_total) * (imp - weighted)
+            return c
+
+        _counts(self.tree_)
+        total = importances.sum()
+        if total > 0:
+            importances /= total
+        return importances
+
     def get_depth(self) -> int:
         """Depth of the fitted tree (a leaf-only tree has depth 0)."""
         check_is_fitted(self)
