@@ -18,188 +18,17 @@ from sklearn.utils import check_random_state
 from sklearn.utils.multiclass import unique_labels
 from sklearn.utils.validation import check_array, check_is_fitted, check_X_y
 
+from once_trees.node import _Node
+
 __all__ = ["ReadOnceDecisionTreeClassifier"]
 
+from once_trees.split import _impurity_from_counts
+
+from once_trees.tree import _build_tree
 
 # Sentinels matching sklearn.tree._tree
 TREE_LEAF = -1
 TREE_UNDEFINED = -2
-
-
-# --------------------------------------------------------------------------- #
-# Tree node
-# --------------------------------------------------------------------------- #
-class _Node:
-    """A single node: an internal split or a leaf.
-
-    Leaves carry ``proba`` (class distribution aligned to ``classes_``).
-    Internal nodes carry ``feature``, ``threshold`` and the two children;
-    a sample goes ``left`` iff ``x[feature] <= threshold``.
-    """
-
-    __slots__ = ("feature", "threshold", "left", "right", "proba", "n_samples",
-                 "missing_go_left")
-
-    def __init__(self, *, proba=None, n_samples=0, feature=None,
-                 threshold=None, left=None, right=None, missing_go_left=True):
-        self.proba = proba
-        self.n_samples = n_samples
-        self.feature = feature
-        self.threshold = threshold
-        self.left = left
-        self.right = right
-        self.missing_go_left = missing_go_left
-
-    @property
-    def is_leaf(self) -> bool:
-        return self.feature is None
-
-
-# --------------------------------------------------------------------------- #
-# Impurity
-# --------------------------------------------------------------------------- #
-def _impurity_from_counts(counts: np.ndarray, criterion: str) -> float:
-    """Impurity of a node given its per-class sample counts."""
-    total = counts.sum()
-    if total == 0:
-        return 0.0
-    p = counts / total
-    if criterion == "gini":
-        return 1.0 - np.dot(p, p)
-    # entropy
-    nz = p > 0
-    return -np.sum(p[nz] * np.log2(p[nz]))
-
-
-# --------------------------------------------------------------------------- #
-# Split finding (operates in ORIGINAL feature-index space)
-# --------------------------------------------------------------------------- #
-def _best_split(X, y_enc, n_classes, available, criterion, min_samples_leaf,
-                feature_order):
-    """Find the best (feature, threshold) over ``available`` features.
-
-    Returns ``(decrease, feature, threshold, missing_go_left)`` for the
-    impurity-reducing split, or ``None`` if no valid split exists.
-    ``feature_order`` decides tie-breaks. Missing values (NaN) do not
-    generate candidate thresholds, but at each candidate they are routed
-    to whichever child yields the larger impurity decrease (sklearn's
-    ``DecisionTreeClassifier`` behavior).
-    """
-    n_samples = X.shape[0]
-    total_counts = np.bincount(y_enc, minlength=n_classes).astype(float)
-    parent_impurity = _impurity_from_counts(total_counts, criterion)
-
-    best = None  # (decrease, feature, threshold, missing_go_left)
-    for f in feature_order:
-        if f not in available:
-            continue
-        col = X[:, f]
-        nan_mask = np.isnan(col)
-        n_nan = int(nan_mask.sum())
-        n_finite = n_samples - n_nan
-        if n_finite < 2:
-            continue
-
-        finite_idx = np.where(~nan_mask)[0]
-        order = finite_idx[np.argsort(col[finite_idx], kind="mergesort")]
-        x_sorted = col[order]
-        y_sorted = y_enc[order]
-
-        nan_counts = (np.bincount(y_enc[nan_mask], minlength=n_classes).astype(float)
-                      if n_nan else np.zeros(n_classes))
-        finite_counts = total_counts - nan_counts
-
-        left_counts = np.zeros(n_classes)
-        right_counts = finite_counts.copy()
-
-        for i in range(1, n_finite):
-            c = y_sorted[i - 1]
-            left_counts[c] += 1.0
-            right_counts[c] -= 1.0
-            # Never split between two identical feature values.
-            if x_sorted[i] == x_sorted[i - 1]:
-                continue
-
-            # Try sending missing rows to whichever side helps more. When
-            # there are no missing rows the two branches are identical and
-            # we keep ``missing_go_left=True`` as the convention default.
-            directions = (True,) if n_nan == 0 else (True, False)
-            for missing_left in directions:
-                if missing_left:
-                    lc = left_counts + nan_counts
-                    rc = right_counts
-                    n_left = i + n_nan
-                    n_right = n_finite - i
-                else:
-                    lc = left_counts
-                    rc = right_counts + nan_counts
-                    n_left = i
-                    n_right = (n_finite - i) + n_nan
-
-                if n_left < min_samples_leaf or n_right < min_samples_leaf:
-                    continue
-
-                imp_left = _impurity_from_counts(lc, criterion)
-                imp_right = _impurity_from_counts(rc, criterion)
-                weighted = (n_left * imp_left + n_right * imp_right) / n_samples
-                decrease = parent_impurity - weighted
-
-                if best is None or decrease > best[0]:
-                    threshold = (x_sorted[i] + x_sorted[i - 1]) / 2.0
-                    best = (decrease, f, threshold, missing_left)
-
-    return best
-
-
-# --------------------------------------------------------------------------- #
-# Recursive tree construction
-# --------------------------------------------------------------------------- #
-def _leaf(y_enc, n_classes) -> _Node:
-    counts = np.bincount(y_enc, minlength=n_classes).astype(float)
-    return _Node(proba=counts / counts.sum(), n_samples=len(y_enc))
-
-
-def _build_tree(X, y_enc, *, depth, available, n_classes, criterion,
-                max_depth, min_samples_leaf, min_impurity_decrease,
-                feature_order) -> _Node:
-    n_samples = X.shape[0]
-    counts = np.bincount(y_enc, minlength=n_classes)
-
-    # --- stopping conditions -------------------------------------------------
-    pure = np.count_nonzero(counts) <= 1
-    if (pure or depth >= max_depth or not available
-        or n_samples < 2 * min_samples_leaf):
-        return _leaf(y_enc, n_classes)
-
-    split = _best_split(X, y_enc, n_classes, available, criterion,
-                        min_samples_leaf, feature_order)
-    if split is None or split[0] <= min_impurity_decrease:
-        return _leaf(y_enc, n_classes)
-
-    _, feature, threshold, missing_go_left = split
-    col = X[:, feature]
-    mask = col <= threshold  # NaN comparisons yield False
-    if missing_go_left:
-        mask = mask | np.isnan(col)
-
-    # The read-once constraint, in one line: the chosen feature is removed
-    # from the set handed to BOTH subtrees, so it can never recur on this path.
-    child_available = available - {feature}
-
-    left = _build_tree(
-        X[mask], y_enc[mask], depth=depth + 1, available=child_available,
-        n_classes=n_classes, criterion=criterion, max_depth=max_depth,
-        min_samples_leaf=min_samples_leaf,
-        min_impurity_decrease=min_impurity_decrease, feature_order=feature_order,
-    )
-    right = _build_tree(
-        X[~mask], y_enc[~mask], depth=depth + 1, available=child_available,
-        n_classes=n_classes, criterion=criterion, max_depth=max_depth,
-        min_samples_leaf=min_samples_leaf,
-        min_impurity_decrease=min_impurity_decrease, feature_order=feature_order,
-    )
-    return _Node(feature=feature, threshold=threshold, left=left, right=right,
-                 n_samples=n_samples, missing_go_left=missing_go_left)
 
 
 # --------------------------------------------------------------------------- #
@@ -270,6 +99,7 @@ class _SklearnTreeAdapter:
         def depth(node):
             return 0 if node.is_leaf else 1 + max(depth(node.left),
                                                   depth(node.right))
+
         self.max_depth = depth(root)
 
 
@@ -403,7 +233,7 @@ class ReadOnceDecisionTreeClassifier(DecisionTreeClassifier):
             weighted = (node.left.n_samples * imp_l
                         + node.right.n_samples * imp_r) / node.n_samples
             importances[node.feature] += (
-                node.n_samples / n_total) * (imp - weighted)
+                                             node.n_samples / n_total) * (imp - weighted)
             return c
 
         _counts(self._root_)
