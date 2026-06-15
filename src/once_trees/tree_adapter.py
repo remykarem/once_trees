@@ -57,13 +57,14 @@ class _SklearnTreeAdapter:
             self.weighted_n_node_samples[i] = node.n_samples
             if node.is_leaf:
                 counts = node.proba * node.n_samples
-                self.value[i, 0, :] = counts
+                self.value[i, 0, :] = node.proba
                 self.impurity[i] = _impurity_from_counts(counts, criterion)
                 return counts
             cl = fill(node.left)
             cr = fill(node.right)
             counts = cl + cr
-            self.value[i, 0, :] = counts
+            total = counts.sum()
+            self.value[i, 0, :] = counts / total if total > 0 else counts
             self.impurity[i] = _impurity_from_counts(counts, criterion)
             self.feature[i] = node.feature
             self.threshold[i] = node.threshold
