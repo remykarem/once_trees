@@ -25,11 +25,7 @@ __all__ = ["ReadOnceDecisionTreeClassifier"]
 from once_trees.split import _impurity_from_counts
 
 from once_trees.tree import _build_tree
-from once_trees.tree_adapter import _SklearnTreeAdapter
-
-# Sentinels matching sklearn.tree._tree
-TREE_LEAF = -1
-TREE_UNDEFINED = -2
+from once_trees.tree_adapter import TREE_LEAF, TREE_UNDEFINED, _SklearnTreeAdapter
 
 
 # --------------------------------------------------------------------------- #

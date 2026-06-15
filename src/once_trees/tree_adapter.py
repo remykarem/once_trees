@@ -3,8 +3,10 @@ from __future__ import annotations
 import numpy as np
 
 from once_trees.node import _Node
-from once_trees.once_trees import TREE_LEAF, TREE_UNDEFINED
 from once_trees.split import _impurity_from_counts
+
+TREE_LEAF = -1
+TREE_UNDEFINED = -2
 
 
 class _SklearnTreeAdapter:
@@ -55,13 +57,13 @@ class _SklearnTreeAdapter:
             self.weighted_n_node_samples[i] = node.n_samples
             if node.is_leaf:
                 counts = node.proba * node.n_samples
-                self.value[i, 0, :] = counts / counts.sum() if counts.sum() else counts
+                self.value[i, 0, :] = counts
                 self.impurity[i] = _impurity_from_counts(counts, criterion)
                 return counts
             cl = fill(node.left)
             cr = fill(node.right)
             counts = cl + cr
-            self.value[i, 0, :] = counts / counts.sum() if counts.sum() else counts
+            self.value[i, 0, :] = counts
             self.impurity[i] = _impurity_from_counts(counts, criterion)
             self.feature[i] = node.feature
             self.threshold[i] = node.threshold
