@@ -32,16 +32,18 @@ class _Node:
     a sample goes ``left`` iff ``x[feature] <= threshold``.
     """
 
-    __slots__ = ("feature", "threshold", "left", "right", "proba", "n_samples")
+    __slots__ = ("feature", "threshold", "left", "right", "proba", "n_samples",
+                 "missing_go_left")
 
     def __init__(self, *, proba=None, n_samples=0, feature=None,
-                 threshold=None, left=None, right=None):
+                 threshold=None, left=None, right=None, missing_go_left=True):
         self.proba = proba
         self.n_samples = n_samples
         self.feature = feature
         self.threshold = threshold
         self.left = left
         self.right = right
+        self.missing_go_left = missing_go_left
 
     @property
     def is_leaf(self) -> bool:
@@ -71,43 +73,75 @@ def _best_split(X, y_enc, n_classes, available, criterion, min_samples_leaf,
                 feature_order):
     """Find the best (feature, threshold) over ``available`` features.
 
-    Returns ``(decrease, feature, threshold)`` for the impurity-reducing split,
-    or ``None`` if no valid split exists. ``feature_order`` decides tie-breaks.
+    Returns ``(decrease, feature, threshold, missing_go_left)`` for the
+    impurity-reducing split, or ``None`` if no valid split exists.
+    ``feature_order`` decides tie-breaks. Missing values (NaN) do not
+    generate candidate thresholds, but at each candidate they are routed
+    to whichever child yields the larger impurity decrease (sklearn's
+    ``DecisionTreeClassifier`` behavior).
     """
     n_samples = X.shape[0]
     total_counts = np.bincount(y_enc, minlength=n_classes).astype(float)
     parent_impurity = _impurity_from_counts(total_counts, criterion)
 
-    best = None  # (decrease, feature, threshold)
+    best = None  # (decrease, feature, threshold, missing_go_left)
     for f in feature_order:
         if f not in available:
             continue
-        order = np.argsort(X[:, f], kind="mergesort")
-        x_sorted = X[order, f]
+        col = X[:, f]
+        nan_mask = np.isnan(col)
+        n_nan = int(nan_mask.sum())
+        n_finite = n_samples - n_nan
+        if n_finite < 2:
+            continue
+
+        finite_idx = np.where(~nan_mask)[0]
+        order = finite_idx[np.argsort(col[finite_idx], kind="mergesort")]
+        x_sorted = col[order]
         y_sorted = y_enc[order]
 
-        left_counts = np.zeros(n_classes)
-        right_counts = total_counts.copy()
+        nan_counts = (np.bincount(y_enc[nan_mask], minlength=n_classes).astype(float)
+                      if n_nan else np.zeros(n_classes))
+        finite_counts = total_counts - nan_counts
 
-        for i in range(1, n_samples):
+        left_counts = np.zeros(n_classes)
+        right_counts = finite_counts.copy()
+
+        for i in range(1, n_finite):
             c = y_sorted[i - 1]
             left_counts[c] += 1.0
             right_counts[c] -= 1.0
             # Never split between two identical feature values.
             if x_sorted[i] == x_sorted[i - 1]:
                 continue
-            n_left, n_right = i, n_samples - i
-            if n_left < min_samples_leaf or n_right < min_samples_leaf:
-                continue
 
-            imp_left = _impurity_from_counts(left_counts, criterion)
-            imp_right = _impurity_from_counts(right_counts, criterion)
-            weighted = (n_left * imp_left + n_right * imp_right) / n_samples
-            decrease = parent_impurity - weighted
+            # Try sending missing rows to whichever side helps more. When
+            # there are no missing rows the two branches are identical and
+            # we keep ``missing_go_left=True`` as the convention default.
+            directions = (True,) if n_nan == 0 else (True, False)
+            for missing_left in directions:
+                if missing_left:
+                    lc = left_counts + nan_counts
+                    rc = right_counts
+                    n_left = i + n_nan
+                    n_right = n_finite - i
+                else:
+                    lc = left_counts
+                    rc = right_counts + nan_counts
+                    n_left = i
+                    n_right = (n_finite - i) + n_nan
 
-            if best is None or decrease > best[0]:
-                threshold = (x_sorted[i] + x_sorted[i - 1]) / 2.0
-                best = (decrease, f, threshold)
+                if n_left < min_samples_leaf or n_right < min_samples_leaf:
+                    continue
+
+                imp_left = _impurity_from_counts(lc, criterion)
+                imp_right = _impurity_from_counts(rc, criterion)
+                weighted = (n_left * imp_left + n_right * imp_right) / n_samples
+                decrease = parent_impurity - weighted
+
+                if best is None or decrease > best[0]:
+                    threshold = (x_sorted[i] + x_sorted[i - 1]) / 2.0
+                    best = (decrease, f, threshold, missing_left)
 
     return best
 
@@ -137,8 +171,11 @@ def _build_tree(X, y_enc, *, depth, available, n_classes, criterion,
     if split is None or split[0] <= min_impurity_decrease:
         return _leaf(y_enc, n_classes)
 
-    _, feature, threshold = split
-    mask = X[:, feature] <= threshold
+    _, feature, threshold, missing_go_left = split
+    col = X[:, feature]
+    mask = col <= threshold  # NaN comparisons yield False
+    if missing_go_left:
+        mask = mask | np.isnan(col)
 
     # The read-once constraint, in one line: the chosen feature is removed
     # from the set handed to BOTH subtrees, so it can never recur on this path.
@@ -157,7 +194,7 @@ def _build_tree(X, y_enc, *, depth, available, n_classes, criterion,
         min_impurity_decrease=min_impurity_decrease, feature_order=feature_order,
     )
     return _Node(feature=feature, threshold=threshold, left=left, right=right,
-                 n_samples=n_samples)
+                 n_samples=n_samples, missing_go_left=missing_go_left)
 
 
 # --------------------------------------------------------------------------- #
@@ -201,7 +238,7 @@ class ReadOnceDecisionTreeClassifier(ClassifierMixin, BaseEstimator):
 
     # -- fitting -------------------------------------------------------------
     def fit(self, X, y):
-        X, y = check_X_y(X, y)
+        X, y = check_X_y(X, y, ensure_all_finite="allow-nan")
         if self.criterion not in ("gini", "entropy"):
             raise ValueError("criterion must be 'gini' or 'entropy'")
 
@@ -228,12 +265,16 @@ class ReadOnceDecisionTreeClassifier(ClassifierMixin, BaseEstimator):
     # -- prediction ----------------------------------------------------------
     def _route(self, row, node: _Node):
         while not node.is_leaf:
-            node = node.left if row[node.feature] <= node.threshold else node.right
+            val = row[node.feature]
+            if np.isnan(val):
+                node = node.left if node.missing_go_left else node.right
+            else:
+                node = node.left if val <= node.threshold else node.right
         return node.proba
 
     def predict_proba(self, X):
         check_is_fitted(self)
-        X = check_array(X)
+        X = check_array(X, ensure_all_finite="allow-nan")
         if X.shape[1] != self.n_features_in_:
             raise ValueError(
                 f"X has {X.shape[1]} features, expected {self.n_features_in_}")
@@ -242,6 +283,9 @@ class ReadOnceDecisionTreeClassifier(ClassifierMixin, BaseEstimator):
     def predict(self, X):
         proba = self.predict_proba(X)
         return self.classes_[np.argmax(proba, axis=1)]
+
+    def _more_tags(self):
+        return {"allow_nan": True}
 
     # -- introspection -------------------------------------------------------
     def get_depth(self) -> int:
