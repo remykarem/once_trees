@@ -53,7 +53,7 @@ def test_all_nan_column_is_skipped():
             return set()
         return {node.feature} | features_used(node.left) | features_used(node.right)
 
-    assert 2 not in features_used(model.tree_)
+    assert 2 not in features_used(model._root_)
 
 
 def test_missing_direction_is_learned():
